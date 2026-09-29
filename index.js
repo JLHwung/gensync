@@ -208,62 +208,138 @@ function wrapGenerator(genFn) {
 }
 
 function buildOperation({ name, arity, sync, async, syncOnly }) {
-  return setFunctionMetadata(name, arity, function*(...args) {
-    const resume = yield GENSYNC_START;
+  const definition = { sync, async, syncOnly };
+  return setFunctionMetadata(name, arity, function(...args) {
+    return new Operation(definition, this, args);
+  });
+}
+
+// 'yield*' passes the results of these steps unchanged up through every
+// delegating generator to the driver. Taking them from a real generator gives
+// them the same shape as the results that generators produce, so the property
+// reads along the way don't turn polymorphic. They are shared by all
+// operations, since nothing modifies iterator results.
+const START_RESULT = (function*() {
+  yield GENSYNC_START;
+})().next();
+const SUSPEND_RESULT = (function*() {
+  yield GENSYNC_SUSPEND;
+})().next();
+
+const OPERATION_INITIAL = 0;
+const OPERATION_STARTED = 1;
+const OPERATION_SUSPENDED = 2;
+const OPERATION_SUSPENDED_SYNC = 3;
+const OPERATION_DONE = 4;
+
+/**
+ * The handler returned by an operation. It behaves like the generator
+ *
+ *   function*(...args) {
+ *     const resume = yield GENSYNC_START;
+ *     if (!resume) return sync.call(this, args);
+ *     // Start the operation, then suspend until it calls 'resume'.
+ *     yield GENSYNC_SUSPEND;
+ *     return result;
+ *   }
+ *
+ * but is written by hand, since creating and resuming a real generator for
+ * every operation is several times slower.
+ */
+class Operation {
+  constructor(definition, thisArg, args) {
+    this.definition = definition;
+    this.thisArg = thisArg;
+    this.args = args;
+    this.state = OPERATION_INITIAL;
+    this.settled = false;
+    this.failed = false;
+    this.result = undefined;
+  }
+
+  [Symbol.iterator]() {
+    return this;
+  }
+
+  next(resume) {
+    switch (this.state) {
+      case OPERATION_INITIAL:
+        this.state = OPERATION_STARTED;
+        return START_RESULT;
+      case OPERATION_STARTED:
+        return this.start(resume);
+      case OPERATION_SUSPENDED:
+        this.state = OPERATION_DONE;
+        if (this.failed) {
+          throw this.result;
+        }
+        return { value: this.result, done: true };
+      case OPERATION_SUSPENDED_SYNC:
+        return this.finishSync();
+      default:
+        return { value: undefined, done: true };
+    }
+  }
+
+  throw(err) {
+    this.state = OPERATION_DONE;
+    throw err;
+  }
+
+  return(value) {
+    this.state = OPERATION_DONE;
+    return { value, done: true };
+  }
+
+  start(resume) {
+    const { async, syncOnly } = this.definition;
     if (!resume) {
-      // Break the tail call to avoid a bug in V8 v6.X with --harmony enabled.
-      const res = sync.call(this, args);
-      return res;
+      return this.finishSync();
     }
 
     if (syncOnly) {
-      if (resume(GENSYNC_SKIP_SUSPEND) !== GENSYNC_SKIP_SUSPEND) {
-        yield GENSYNC_SUSPEND;
+      if (resume(GENSYNC_SKIP_SUSPEND) === GENSYNC_SKIP_SUSPEND) {
+        return this.finishSync();
       }
-      const res = sync.call(this, args);
-      return res;
-    }
-
-    let settled = false;
-    let failed = false;
-    let result;
-    try {
-      async.call(
-        this,
-        args,
-        value => {
-          if (settled) return;
-
-          settled = true;
-          result = value;
-          resume();
-        },
-        err => {
-          if (settled) return;
-
-          settled = true;
-          failed = true;
-          result = err;
-          resume();
-        }
-      );
-    } catch (err) {
-      settled = true;
-      failed = true;
-      result = err;
-      resume();
+      this.state = OPERATION_SUSPENDED_SYNC;
+      return SUSPEND_RESULT;
     }
 
     // Suspend until the callbacks run. Will resume synchronously if the
     // callback was already called.
-    yield GENSYNC_SUSPEND;
-
-    if (failed) {
-      throw result;
+    this.state = OPERATION_SUSPENDED;
+    try {
+      async.call(
+        this.thisArg,
+        this.args,
+        value => this.settle(false, value, resume),
+        err => this.settle(true, err, resume)
+      );
+    } catch (err) {
+      this.settled = true;
+      this.failed = true;
+      this.result = err;
+      resume();
     }
+    return SUSPEND_RESULT;
+  }
 
-    return result;
-  });
+  finishSync() {
+    this.state = OPERATION_DONE;
+    return {
+      value: this.definition.sync.call(this.thisArg, this.args),
+      done: true,
+    };
+  }
+
+  settle(failed, result, resume) {
+    if (this.settled) return;
+
+    this.settled = true;
+    this.failed = failed;
+    this.result = result;
+    resume();
+  }
 }
 
 function evaluateSync(gen) {

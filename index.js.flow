@@ -11,6 +11,9 @@ export type Gensync<Args, Return> = {
   errback(...args: any[]): void,
 };
 
+// Functions built from options return a lightweight iterator rather than a
+// real generator object. Flow's `Generator` is a structural interface (just
+// `@@iterator`, `next`, `return` and `throw`), so it describes both.
 export type Handler<Return> = Generator<Yield, Return, Next>;
 export type Options<Args, Return> = {
   sync(...args: Args): Return,
