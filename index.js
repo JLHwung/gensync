@@ -30,8 +30,8 @@ module.exports = Object.assign(
     all: buildOperation({
       name: "all",
       arity: 1,
-      sync: function(args) {
-        const items = Array.from(args[0]);
+      sync: function(iterable) {
+        const items = Array.from(iterable);
         return items.map(item => evaluateSync(item));
       },
       async: function(args, resolve, reject) {
@@ -61,8 +61,8 @@ module.exports = Object.assign(
     race: buildOperation({
       name: "race",
       arity: 1,
-      sync: function(args) {
-        const items = Array.from(args[0]);
+      sync: function(iterable) {
+        const items = Array.from(iterable);
         if (items.length === 0) {
           throw makeError("Must race at least 1 item", GENSYNC_RACE_NONEMPTY);
         }
@@ -183,9 +183,7 @@ function newGenerator({ name, arity, sync, async, errback }) {
     name,
     arity,
     syncOnly: !async && !errback,
-    sync: function(args) {
-      return sync.apply(this, args);
-    },
+    sync,
     async: function(args, resolve, reject) {
       if (async) {
         async.apply(this, args).then(resolve, reject);
@@ -267,6 +265,11 @@ class Operation {
         this.state = OPERATION_STARTED;
         return START_RESULT;
       case OPERATION_STARTED:
+        // Handle sync mode here rather than in 'start', so that the code
+        // inlined into callers for it stays small.
+        if (!resume) {
+          return this.finishSync();
+        }
         return this.start(resume);
       case OPERATION_SUSPENDED:
         this.state = OPERATION_DONE;
@@ -293,10 +296,6 @@ class Operation {
 
   start(resume) {
     const { async, syncOnly } = this.definition;
-    if (!resume) {
-      return this.finishSync();
-    }
-
     if (syncOnly) {
       if (resume(GENSYNC_SKIP_SUSPEND) === GENSYNC_SKIP_SUSPEND) {
         return this.finishSync();
@@ -327,7 +326,7 @@ class Operation {
   finishSync() {
     this.state = OPERATION_DONE;
     return {
-      value: this.definition.sync.call(this.thisArg, this.args),
+      value: callSync(this.definition.sync, this.thisArg, this.args),
       done: true,
     };
   }
@@ -340,6 +339,24 @@ class Operation {
     this.result = result;
     resume();
   }
+}
+
+// Calls an operation's sync handler with the operation's arguments. V8 runs
+// direct calls considerably faster than '.call' or '.apply', so this uses one
+// for the common cases. It is kept separate from other call sites, and small,
+// so that it inlines well without crowding out inlining in the caller.
+function callSync(fn, thisArg, args) {
+  if (thisArg === undefined) {
+    switch (args.length) {
+      case 0:
+        return fn();
+      case 1:
+        return fn(args[0]);
+      case 2:
+        return fn(args[0], args[1]);
+    }
+  }
+  return fn.apply(thisArg, args);
 }
 
 function evaluateSync(gen) {
