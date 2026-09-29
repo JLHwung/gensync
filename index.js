@@ -224,26 +224,33 @@ function buildOperation({ name, arity, sync, async, syncOnly }) {
       return res;
     }
 
+    let settled = false;
+    let failed = false;
     let result;
     try {
       async.call(
         this,
         args,
         value => {
-          if (result) return;
+          if (settled) return;
 
-          result = { value };
+          settled = true;
+          result = value;
           resume();
         },
         err => {
-          if (result) return;
+          if (settled) return;
 
-          result = { err };
+          settled = true;
+          failed = true;
+          result = err;
           resume();
         }
       );
     } catch (err) {
-      result = { err };
+      settled = true;
+      failed = true;
+      result = err;
       resume();
     }
 
@@ -251,11 +258,11 @@ function buildOperation({ name, arity, sync, async, syncOnly }) {
     // callback was already called.
     yield GENSYNC_SUSPEND;
 
-    if (result.hasOwnProperty("err")) {
-      throw result.err;
+    if (failed) {
+      throw result;
     }
 
-    return result.value;
+    return result;
   });
 }
 
