@@ -4,6 +4,10 @@
 // library can work together in case they are not deduped.
 const GENSYNC_START = Symbol.for("gensync:v1:start");
 const GENSYNC_SUSPEND = Symbol.for("gensync:v1:suspend");
+// An operation may pass this to the resume callback to complete without
+// suspending. Drivers that allow it return it back. Drivers from older copies
+// treat it as an ordinary resume, so the operation must then still suspend.
+const GENSYNC_SKIP_SUSPEND = Symbol.for("gensync:v1:skip-suspend");
 
 const GENSYNC_EXPECTED_START = "GENSYNC_EXPECTED_START";
 const GENSYNC_EXPECTED_SUSPEND = "GENSYNC_EXPECTED_SUSPEND";
@@ -178,6 +182,7 @@ function newGenerator({ name, arity, sync, async, errback }) {
   return buildOperation({
     name,
     arity,
+    syncOnly: !async && !errback,
     sync: function(args) {
       return sync.apply(this, args);
     },
@@ -202,11 +207,19 @@ function wrapGenerator(genFn) {
   });
 }
 
-function buildOperation({ name, arity, sync, async }) {
+function buildOperation({ name, arity, sync, async, syncOnly }) {
   return setFunctionMetadata(name, arity, function*(...args) {
     const resume = yield GENSYNC_START;
     if (!resume) {
       // Break the tail call to avoid a bug in V8 v6.X with --harmony enabled.
+      const res = sync.call(this, args);
+      return res;
+    }
+
+    if (syncOnly) {
+      if (resume(GENSYNC_SKIP_SUSPEND) !== GENSYNC_SKIP_SUSPEND) {
+        yield GENSYNC_SUSPEND;
+      }
       const res = sync.call(this, args);
       return res;
     }
@@ -255,25 +268,43 @@ function evaluateSync(gen) {
 }
 
 function evaluateAsync(gen, resolve, reject) {
-  (function step() {
+  let sync = false;
+  let didSyncResume = false;
+  let didSkipSuspend = false;
+  const resume = request => {
+    if (sync) {
+      if (request === GENSYNC_SKIP_SUSPEND) {
+        didSkipSuspend = true;
+        return GENSYNC_SKIP_SUSPEND;
+      }
+      didSyncResume = true;
+    } else {
+      step();
+    }
+  };
+
+  step();
+
+  function step() {
     try {
-      let value;
-      while (!({ value } = gen.next()).done) {
-        assertStart(value, gen);
+      let out = gen.next();
+      while (!out.done) {
+        assertStart(out.value, gen);
 
         // If this throws, it is considered to have broken the contract
         // established for async handlers. If these handlers are called
         // synchronously, it is also considered bad behavior.
-        let sync = true;
-        let didSyncResume = false;
-        const out = gen.next(() => {
-          if (sync) {
-            didSyncResume = true;
-          } else {
-            step();
-          }
-        });
+        sync = true;
+        didSyncResume = false;
+        didSkipSuspend = false;
+        out = gen.next(resume);
         sync = false;
+
+        if (didSkipSuspend) {
+          // The operation completed without suspending, so 'out' is already
+          // the generator's next step.
+          continue;
+        }
 
         assertSuspend(out, gen);
 
@@ -282,13 +313,15 @@ function evaluateAsync(gen, resolve, reject) {
           // and let it call 'step' later.
           return;
         }
+
+        out = gen.next();
       }
 
-      return resolve(value);
+      return resolve(out.value);
     } catch (err) {
       return reject(err);
     }
-  })();
+  }
 }
 
 function assertStart(value, gen) {

@@ -218,6 +218,28 @@ describe("gensync({})", () => {
 
       await expectResult(fn, 42, { error: "[42]", expectSync: true });
     });
+
+    test("suspends for drivers that can't skip suspending", () => {
+      const fn = gensync({
+        sync: (...args) => JSON.stringify(args),
+      });
+
+      // Drive the operation like an older copy of gensync would, with a resume
+      // callback that doesn't acknowledge GENSYNC_SKIP_SUSPEND.
+      const gen = fn(42);
+      expect(gen.next().value).toBe(Symbol.for("gensync:v1:start"));
+      let resumed = false;
+      expect(
+        gen.next(() => {
+          resumed = true;
+        })
+      ).toEqual({
+        value: Symbol.for("gensync:v1:suspend"),
+        done: false,
+      });
+      expect(resumed).toBe(true);
+      expect(gen.next()).toEqual({ value: "[42]", done: true });
+    });
   });
 
   describe("'async' handler", async () => {
